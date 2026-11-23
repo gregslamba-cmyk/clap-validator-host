@@ -1,0 +1,19 @@
+[package]
+name = "clap-validator-host"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "clap-validator-host"
+path = "src/main.rs"
+
+[dependencies]
+clap-sys = { git = "https://github.com/micahrj/clap-sys.git", rev = "25d7f53fdb6363ad63fbd80049cb7a42a97ac156" }
+libc = "0.2"
+libloading = "0.7.4"
+realfft = "3.5"
+rustfft = "6.4"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+csv = "1.3"
