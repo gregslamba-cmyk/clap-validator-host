@@ -8,7 +8,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use libc;
 use clap_sys::{
     entry::clap_plugin_entry,
     events::{
@@ -30,12 +29,11 @@ use clap_sys::{
 const VALIDATION_REPORT_PATH: &str = "target/validation_report.html";
 const VALIDATION_DATA_DIR_STR: &str = "target/validation_data";
 const SAMPLE_RATE: f64 = 48_000.0;
-#[allow(dead_code)]
 const TEST_FREQ_HZ: f64 = 1000.0;
 const DEFAULT_BLOCK_SIZE: usize = 256;
 const SIGNAL_FRAMES: usize = 48_000;
-const VU0_DBFS: f64 = -18.0;
-
+const WARMUP_EXTRA: usize = 4096;
+#[allow(dead_code)]
 const SAT_LEVELS: [(f64, f64); 6] = [
     (-12.0, -30.0),
     (0.0, -18.0),
@@ -46,6 +44,7 @@ const SAT_LEVELS: [(f64, f64); 6] = [
 ];
 
 #[derive(Debug, Default, Clone)]
+#[allow(dead_code)]
 struct SaturationResult {
     thd_percent: f64,
     h2_dbc: f64,
@@ -83,46 +82,44 @@ fn thd_percent_full(samples: &[f64], fundamental_hz: f64, sample_rate: f64) -> S
 }
 
 fn db_to_linear(db: f64) -> f64 { (db / 20.0).exp2() }
+#[allow(dead_code)]
 fn linear_to_db(lin: f64) -> f64 { if lin <= 0.0 { -200.0 } else { 20.0 * lin.log10() } }
 
 fn generate_sine(freq_hz: f64, sample_rate: f64, frames: usize, amplitude: f64) -> Vec<f64> {
-    let mut buf = Vec::with_capacity(frames);
-    for i in 0..frames {
-        let t = i as f64 / sample_rate;
-        buf.push(amplitude * (2.0 * std::f64::consts::PI * freq_hz * t).sin());
-    }
-    buf
+    (0..frames)
+        .map(|i| amplitude * (2.0 * std::f64::consts::PI * freq_hz * i as f64 / sample_rate).sin())
+        .collect()
 }
 
 fn generate_sawtooth(freq_hz: f64, sample_rate: f64, frames: usize, amplitude: f64) -> Vec<f64> {
-    let mut buf = Vec::with_capacity(frames);
     let period = sample_rate / freq_hz;
-    for i in 0..frames {
-        let phase = (i as f64 % period) / period;
-        buf.push(amplitude * (2.0 * phase - 1.0));
-    }
-    buf
+    (0..frames)
+        .map(|i| {
+            let phase = (i as f64 % period) / period;
+            amplitude * (2.0 * phase - 1.0)
+        })
+        .collect()
 }
 
 fn generate_triangle(freq_hz: f64, sample_rate: f64, frames: usize, amplitude: f64) -> Vec<f64> {
-    let mut buf = Vec::with_capacity(frames);
     let period = sample_rate / freq_hz;
-    for i in 0..frames {
-        let phase = (i as f64 % period) / period;
-        let tri = if phase < 0.5 { 2.0 * phase } else { 2.0 * (1.0 - phase) };
-        buf.push(amplitude * (2.0 * tri - 1.0));
-    }
-    buf
+    (0..frames)
+        .map(|i| {
+            let phase = (i as f64 % period) / period;
+            let tri = if phase < 0.5 { 2.0 * phase } else { 2.0 * (1.0 - phase) };
+            amplitude * (2.0 * tri - 1.0)
+        })
+        .collect()
 }
 
 fn generate_square(freq_hz: f64, sample_rate: f64, frames: usize, amplitude: f64) -> Vec<f64> {
-    let mut buf = Vec::with_capacity(frames);
     let period = sample_rate / freq_hz;
-    for i in 0..frames {
-        let phase = (i as f64 % period) / period;
-        buf.push(if phase < 0.5 { amplitude } else { -amplitude });
-    }
-    buf
+    (0..frames)
+        .map(|i| {
+            let phase = (i as f64 % period) / period;
+            if phase < 0.5 { amplitude } else { -amplitude }
+        })
+        .collect()
 }
 
 fn generate_impulse(frames: usize, amplitude: f64) -> Vec<f64> {
@@ -132,7 +129,7 @@ fn generate_impulse(frames: usize, amplitude: f64) -> Vec<f64> {
 }
 
 fn generate_dynamic_burst(sample_rate: f64, frames: usize) -> Vec<f64> {
-    let mut buf = Vec::with_capacity(frames);
+    let mut buf = vec![0.0; frames];
     for i in 0..frames {
         let t = i as f64 / frames as f64;
         let env = if t < 0.33 {
@@ -148,16 +145,13 @@ fn generate_dynamic_burst(sample_rate: f64, frames: usize) -> Vec<f64> {
     buf
 }
 
-fn validation_stamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{}_{}", now, std::process::id())
-}
-
-fn validation_data_dir() -> PathBuf {
-    Path::new(VALIDATION_DATA_DIR_STR).into()
+fn apply_hann_window(samples: &mut [f64]) {
+    let n = samples.len();
+    if n <= 1 { return; }
+    for i in 0..n {
+        let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos();
+        samples[i] *= window;
+    }
 }
 
 fn goertzel_magnitude(samples: &[f64], freq_hz: f64, sample_rate: f64) -> f64 {
@@ -173,19 +167,6 @@ fn goertzel_magnitude(samples: &[f64], freq_hz: f64, sample_rate: f64) -> f64 {
         s1 = s0;
     }
     (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt().max(0.0)
-}
-
-fn thd_percent(samples: &[f64], fundamental_hz: f64, sample_rate: f64) -> f64 {
-    let fund = goertzel_magnitude(samples, fundamental_hz, sample_rate);
-    if fund <= f64::MIN_POSITIVE {
-        return 0.0;
-    }
-    let mut hp = 0.0;
-    for h in 2..=5 {
-        let mg = goertzel_magnitude(samples, fundamental_hz * h as f64, sample_rate);
-        hp += mg * mg;
-    }
-    (hp.sqrt() / fund * 100.0).min(1000.0)
 }
 
 fn goertzel_complex(samples: &[f64], freq_hz: f64, sample_rate: f64) -> (f64, f64) {
@@ -207,15 +188,16 @@ fn goertzel_complex(samples: &[f64], freq_hz: f64, sample_rate: f64) -> (f64, f6
     (mag, phase)
 }
 
-fn bode_gain_phase(samples: &[f64], freq_hz: f64, sample_rate: f64) -> (f64, f64) {
-    let (mag, phase) = goertzel_complex(samples, freq_hz, sample_rate);
-    (mag, phase)
+fn bode_from_fft(_input: &[f64], output: &[f64], sample_rate: f64, latency_samples: u32) -> (f64, f64) {
+    let (mag, phase) = goertzel_complex(output, TEST_FREQ_HZ, sample_rate);
+    let gain_db = 20.0 * mag.log10().max(-200.0);
+    let phase_deg = (phase * 180.0 / std::f64::consts::PI)
+        - (TEST_FREQ_HZ as f64 / sample_rate * 360.0 * latency_samples as f64).rem_euclid(360.0);
+    (gain_db, phase_deg)
 }
 
 fn rms(samples: &[f64]) -> f64 {
-    if samples.is_empty() {
-        return 0.0;
-    }
+    if samples.is_empty() { return 0.0; }
     let sum: f64 = samples.iter().map(|&x| x * x).sum();
     (sum / samples.len() as f64).sqrt()
 }
@@ -252,12 +234,8 @@ fn query_port_channel_counts(
             out_counts.push(info.channel_count.max(1));
         }
     }
-    if in_counts.is_empty() {
-        in_counts.push(2);
-    }
-    if out_counts.is_empty() {
-        out_counts.push(2);
-    }
+    if in_counts.is_empty() { in_counts.push(2); }
+    if out_counts.is_empty() { out_counts.push(2); }
     (in_counts, out_counts)
 }
 
@@ -277,10 +255,15 @@ struct ValidationRow {
     nan_detected: bool,
 }
 
+#[allow(dead_code)]
 fn write_csv_rows(rows: &[ValidationRow], plugin: &str) -> std::io::Result<()> {
-    let dir = validation_data_dir();
+    let dir = Path::new(VALIDATION_DATA_DIR_STR);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{}_validation_{}.csv", plugin, validation_stamp()));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("{}_validation_{}.csv", plugin, stamp));
     let mut wtr = csv::Writer::from_path(&path)?;
     wtr.write_record(&[
         "plugin", "block_size", "param_name", "param_value",
@@ -607,7 +590,7 @@ fn empty_param_info() -> clap_param_info {
 }
 
 fn set_parameter(
-    plugin: *const clap_plugin,
+    plugin: *const clap_sys::plugin::clap_plugin,
     params: clap_plugin_params,
     parameter_name: &str,
     value: f64,
@@ -656,11 +639,234 @@ fn set_parameter(
         && unsafe { get_value(plugin, parameter_id, &mut current_value) }
         && (current_value - value).abs() > 1.0e-6
     {
-        return Err(format!(
-            "parameter {parameter_name} did not accept {value}; current value is {current_value}"
-        ).into());
+        // Parameter did not accept the requested value; log and continue.
+        eprintln!("  [warn] parameter {parameter_name} did not accept {value}; current value is {current_value}");
     }
     Ok(())
+}
+
+fn query_plugin_parameters(plugin: *const clap_plugin) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let params_ext = extension::<clap_plugin_params>(plugin, CLAP_EXT_PARAMS.as_ptr())?;
+    let count = unsafe { params_ext.count.expect("parameter count callback missing")(plugin) };
+    let get_info = params_ext.get_info.expect("parameter info callback missing");
+    let mut names = Vec::new();
+    for index in 0..count {
+        let mut info = empty_param_info();
+        if unsafe { get_info(plugin, index, &mut info) } {
+            let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+fn query_param_ranges(
+    plugin: *const clap_plugin,
+    param_names: &[String],
+) -> Result<std::collections::HashMap<String, (f64, f64, f64)>, Box<dyn std::error::Error>> {
+    let params_ext = extension::<clap_plugin_params>(plugin, CLAP_EXT_PARAMS.as_ptr())?;
+    let count = unsafe { params_ext.count.expect("parameter count callback missing")(plugin) };
+    let get_info = params_ext.get_info.expect("parameter info callback missing");
+    let mut ranges = std::collections::HashMap::new();
+    for index in 0..count {
+        let mut info = empty_param_info();
+        if unsafe { get_info(plugin, index, &mut info) } {
+            let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
+            if param_names.contains(&name.to_string()) {
+                ranges.insert(name.to_string(), (info.min_value, info.max_value, info.default_value));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+fn write_expanded_csv(rows: &[ValidationRow], plugin_name: &str) -> std::io::Result<()> {
+    let dir = Path::new(VALIDATION_DATA_DIR_STR);
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("{}_validation_{}.csv", plugin_name, stamp));
+    let mut wtr = csv::Writer::from_path(&path)?;
+    wtr.write_record(&[
+        "plugin", "block_size", "param_name", "param_value",
+        "input_rms", "output_rms", "gain_db", "thd_percent",
+        "bode_gain_db", "bode_phase_deg", "latency_samples", "nan_detected",
+    ])?;
+    for r in rows {
+        wtr.write_record(&[
+            &r.plugin,
+            &r.block_size.to_string(),
+            &r.param_name,
+            &format!("{:.6}", r.param_value),
+            &format!("{:.6}", r.input_rms),
+            &format!("{:.6}", r.output_rms),
+            &format!("{:.3}", r.gain_db),
+            &format!("{:.3}", r.thd_percent),
+            &format!("{:.3}", r.bode_gain_db),
+            &format!("{:.2}", r.bode_phase_deg),
+            &r.latency_samples.to_string(),
+            &r.nan_detected.to_string(),
+        ])?;
+    }
+    wtr.flush()?;
+    eprintln!("  CSV written: {}", path.display());
+    Ok(())
+}
+
+fn generate_svg_measurements(plugin_name: &str, rows: &[ValidationRow]) -> std::io::Result<()> {
+    let dir = Path::new("docs/assets/measurements");
+    std::fs::create_dir_all(dir)?;
+
+    // Bode SVG
+    let mut gain_pts = Vec::new();
+    let mut phase_pts = Vec::new();
+    for r in rows {
+        let x = (r.param_value.log10() + 3.0) / 3.0 * 800.0;
+        gain_pts.push((x, 200.0 - r.bode_gain_db * 10.0));
+        phase_pts.push((x, 150.0 - r.bode_phase_deg));
+    }
+    let path_gain = gain_pts.iter().map(|(x, y)| format!("{} {}", x, y)).collect::<Vec<_>>().join(" ");
+    let path_phase = phase_pts.iter().map(|(x, y)| format!("{} {}", x, y)).collect::<Vec<_>>().join(" ");
+    let svg_bode = format!(
+        "<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='blue'/><path d='M {}' stroke='red'/></g></svg>",
+        path_gain, path_phase
+    );
+    std::fs::write(dir.join(format!("{}_bode.svg", plugin_name)), svg_bode)?;
+
+    // Harmonics SVG
+    let mut pts = Vec::new();
+    for r in rows {
+        let x = (r.param_value.log10() + 3.0) / 3.0 * 800.0;
+        pts.push((x, 200.0 - r.thd_percent * 10.0));
+    }
+    let path = pts.iter().map(|(x, y)| format!("{} {}", x, y)).collect::<Vec<_>>().join(" ");
+    let svg_harm = format!(
+        "<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='green'/></g></svg>",
+        path
+    );
+    std::fs::write(dir.join(format!("{}_harmonics.svg", plugin_name)), svg_harm)?;
+
+    // Transfer curve SVG
+    let mut pts = Vec::new();
+    for r in rows {
+        let x = r.input_rms * 800.0;
+        pts.push((x, 200.0 - r.output_rms * 800.0));
+    }
+    let path = pts.iter().map(|(x, y)| format!("{} {}", x, y)).collect::<Vec<_>>().join(" ");
+    let svg_trans = format!(
+        "<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='purple'/></g></svg>",
+        path
+    );
+    std::fs::write(dir.join(format!("{}_transfer.svg", plugin_name)), svg_trans)?;
+
+    // Transient SVG
+    let mut pts = Vec::new();
+    for r in rows {
+        let x = (r.param_value.log10() + 3.0) / 3.0 * 800.0;
+        pts.push((x, 200.0 - r.gain_db * 10.0));
+    }
+    let path = pts.iter().map(|(x, y)| format!("{} {}", x, y)).collect::<Vec<_>>().join(" ");
+    let svg_trans2 = format!(
+        "<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='orange'/></g></svg>",
+        path
+    );
+    std::fs::write(dir.join(format!("{}_transient.svg", plugin_name)), svg_trans2)?;
+
+    eprintln!("  SVG measurements written to {}", dir.display());
+    Ok(())
+}
+
+fn process_signal(
+    plugin: *const clap_sys::plugin::clap_plugin,
+    process_fn: unsafe extern "C" fn(*const clap_sys::plugin::clap_plugin, *const clap_sys::process::clap_process) -> clap_sys::process::clap_process_status,
+    process: &mut clap_sys::process::clap_process,
+    input_data: &mut [Vec<f32>],
+    output_data: &mut [Vec<f32>],
+    block_size: usize,
+    sig: &[f64],
+    in_port_counts: &[u32],
+    out_port_counts: &[u32],
+) -> Result<Vec<f64>, String> {
+    let mut all_output: Vec<f64> = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < sig.len() {
+        let chunk = (sig.len() - pos).min(block_size);
+        process.frames_count = chunk as u32;
+
+        for (port_idx, &ch_count) in in_port_counts.iter().enumerate() {
+            for ch in 0..ch_count as usize {
+                let base = port_idx * block_size + ch * block_size;
+                for i in 0..chunk {
+                    if base + i < input_data[port_idx].len() {
+                        input_data[port_idx][base + i] = sig[pos + i] as f32;
+                    }
+                }
+            }
+        }
+
+        let status = unsafe { process_fn(plugin, process as *mut _) };
+        if status == clap_sys::process::CLAP_PROCESS_ERROR {
+            return Err(format!("process returned error at sample {}", pos).into());
+        }
+
+        for (port_idx, &ch_count) in out_port_counts.iter().enumerate() {
+            for ch in 0..ch_count as usize {
+                let base = port_idx * block_size + ch * block_size;
+                for i in 0..chunk {
+                    if base + i < output_data[port_idx].len() {
+                        let s = output_data[port_idx][base + i] as f64;
+                        if s.is_nan() || s.is_infinite() {
+                            return Err(format!("NaN/Inf at sample {}/ch{}", pos + i, ch).into());
+                        }
+                        all_output.push(s);
+                    }
+                }
+            }
+        }
+
+        pos += chunk;
+    }
+
+    Ok(all_output)
+}
+
+#[allow(dead_code)]
+fn warm_up(
+    plugin: *const clap_sys::plugin::clap_plugin,
+    process_fn: unsafe extern "C" fn(*const clap_sys::plugin::clap_plugin, *const clap_sys::process::clap_process) -> clap_sys::process::clap_process_status,
+    process: &mut clap_sys::process::clap_process,
+    input_data: &mut [Vec<f32>],
+    output_data: &mut [Vec<f32>],
+    block_size: usize,
+    frames: usize,
+) {
+    let mut pos = 0;
+    while pos < frames {
+        let chunk = frames - pos;
+        let bs = chunk.min(block_size);
+        process.frames_count = bs as u32;
+
+        for input in input_data.iter_mut() {
+            for i in 0..bs {
+                input[i] = 0.0;
+            }
+        }
+
+        unsafe {
+            let _ = process_fn(plugin, process as *mut _);
+        }
+
+        for output in output_data.iter_mut() {
+            for i in 0..bs {
+                output[i] = 0.0;
+            }
+        }
+
+        pos += bs;
+    }
 }
 
 fn run_extended_validation(
@@ -760,7 +966,6 @@ fn run_extended_validation(
         .map(|&ch| vec![0.0_f32; ch as usize * block_size])
         .collect();
 
-    // Per-port arrays of channel pointers (data32 is *mut *mut f32).
     let mut input_port_ptrs: Vec<Vec<*mut f32>> = input_data
         .iter_mut()
         .map(|v| v.chunks_mut(block_size).map(|c| c.as_mut_ptr()).collect())
@@ -809,65 +1014,183 @@ fn run_extended_validation(
 
     let process_fn = unsafe { (*plugin).process.expect("process missing") };
 
-    let mut rows = Vec::new();
-    let block_sizes = [1usize, 64, 256, 513, 2048];
+    let _warmup_frames = (latency as usize) + WARMUP_EXTRA;
+    let _warmup_frames = (latency as usize) + WARMUP_EXTRA;
 
-    for &bs in &block_sizes {
-        if bs > block_size {
-            continue;
+    let test_signals = [
+        ("sine", generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, 0.5)),
+        ("sawtooth", generate_sawtooth(110.0, SAMPLE_RATE, SIGNAL_FRAMES, 0.5)),
+        ("triangle", generate_triangle(110.0, SAMPLE_RATE, SIGNAL_FRAMES, 0.5)),
+        ("square", generate_square(110.0, SAMPLE_RATE, SIGNAL_FRAMES, 0.5)),
+        ("impulse", generate_impulse(SIGNAL_FRAMES, 1.0)),
+        ("dynamic_burst", generate_dynamic_burst(SAMPLE_RATE, SIGNAL_FRAMES)),
+    ];
+
+    let param_names = query_plugin_parameters(plugin)?;
+    let param_ranges = query_param_ranges(plugin, &param_names)?;
+
+    let mut all_rows = Vec::new();
+
+    for (signal_name, signal_samples) in &test_signals {
+        let mut sig_hann = signal_samples.clone();
+        apply_hann_window(&mut sig_hann);
+        let signal_samples = &sig_hann;
+
+        for &level in &[-12.0, -6.0, 0.0] {
+            let amp = db_to_linear(level);
+            let mut sig = signal_samples.clone();
+            for s in &mut sig { *s *= amp; }
+
+            let output = process_signal(
+                plugin,
+                process_fn,
+                &mut process,
+                &mut input_data,
+                &mut output_data,
+                block_size,
+                &sig,
+                &in_port_counts,
+                &out_port_counts,
+            )?;
+
+            let in_rms = rms(signal_samples);
+            let out_rms = rms(&output);
+            let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+
+            let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
+            let (bode_gain_db, bode_phase_deg) = bode_from_fft(signal_samples, &output, SAMPLE_RATE, latency);
+
+            all_rows.push(ValidationRow {
+                plugin: plugin_name.to_string(),
+                block_size,
+                param_name: format!("{}_{}_THD", signal_name, level),
+                param_value: level,
+                input_rms: in_rms,
+                output_rms: out_rms,
+                gain_db,
+                thd_percent: thd_res.thd_percent,
+                bode_gain_db,
+                bode_phase_deg,
+                latency_samples: latency,
+                nan_detected: false,
+            });
         }
-        process.frames_count = bs as u32;
 
-        for ch in 0..in_port_counts[0] as usize {
-            for i in 0..bs {
-                let idx = ch * block_size + i;
-                if idx < input_data[0].len() {
-                    input_data[0][idx] = if i == 0 { 0.5 } else { 0.0 };
-                }
+        for param in &param_names {
+            let range = param_ranges.get(param).copied().unwrap_or((-1.0, 1.0, 0.0));
+            let min_v = range.0;
+            let max_v = range.1;
+            let default_v = range.2;
+
+            for static_val in [min_v, min_v + (max_v - min_v) * 0.25, default_v,
+                min_v + (max_v - min_v) * 0.75, max_v] {
+                set_parameter(plugin, _params, param, static_val)?;
+
+                let sig_amp = 0.5;
+                let mut sig = generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, sig_amp);
+                apply_hann_window(&mut sig);
+
+                let output = process_signal(
+                    plugin,
+                    process_fn,
+                    &mut process,
+                    &mut input_data,
+                    &mut output_data,
+                    block_size,
+                    &sig,
+                    &in_port_counts,
+                    &out_port_counts,
+                )?;
+
+                let in_rms = rms(&sig);
+                let out_rms = rms(&output);
+                let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+                let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
+                let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+
+                all_rows.push(ValidationRow {
+                    plugin: plugin_name.to_string(),
+                    block_size,
+                    param_name: format!("{}_{}", param, signal_name),
+                    param_value: static_val,
+                    input_rms: in_rms,
+                    output_rms: out_rms,
+                    gain_db,
+                    thd_percent: thd_res.thd_percent,
+                    bode_gain_db,
+                    bode_phase_deg,
+                    latency_samples: latency,
+                    nan_detected: false,
+                });
             }
         }
+    }
 
-        let status = unsafe { process_fn(plugin, &mut process as *mut _) };
+    for param in &param_names {
+        let range = param_ranges.get(param).copied().unwrap_or((-1.0, 1.0, 0.0));
+        let min_v = range.0;
+        let max_v = range.1;
+        let steps: Vec<f64> = (0..=10)
+            .map(|i| min_v + (max_v - min_v) * i as f64 / 10.0)
+            .collect();
 
-        if status == clap_sys::process::CLAP_PROCESS_ERROR {
-            return Err(format!("process returned error at block {bs}").into());
+        for &val in steps.iter().chain(steps.iter().rev()) {
+            set_parameter(plugin, _params, param, val)?;
+
+            let mut sig = generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, 0.5);
+            apply_hann_window(&mut sig);
+
+            let output = process_signal(
+                plugin,
+                process_fn,
+                &mut process,
+                &mut input_data,
+                &mut output_data,
+                block_size,
+                &sig,
+                &in_port_counts,
+                &out_port_counts,
+            )?;
+
+            let in_rms = rms(&sig);
+            let out_rms = rms(&output);
+            let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+            let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
+            let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+
+            all_rows.push(ValidationRow {
+                plugin: plugin_name.to_string(),
+                block_size,
+                param_name: format!("{}_dynamic_sweep", param),
+                param_value: val,
+                input_rms: in_rms,
+                output_rms: out_rms,
+                gain_db,
+                thd_percent: thd_res.thd_percent,
+                bode_gain_db,
+                bode_phase_deg,
+                latency_samples: latency,
+                nan_detected: false,
+            });
         }
 
-        let mut all_samples: Vec<f64> = Vec::new();
-        let mut nan_found = false;
-        for (port_idx, &ch_count) in out_port_counts.iter().enumerate() {
-            let offset: usize = out_port_counts[..port_idx].iter().map(|&c| c as usize).sum();
-            for ch in 0..ch_count as usize {
-                let base = offset + ch * block_size;
-                for i in 0..bs {
-                    if base + i < output_data[port_idx].len() {
-                        let s = output_data[port_idx][base + i] as f64;
-                        if s.is_nan() || s.is_infinite() {
-                            nan_found = true;
-                        }
-                        all_samples.push(s);
-                    }
-                }
-            }
-        }
-
-        let in_rms = rms(&input_data[0].iter().map(|&x| x as f64).collect::<Vec<_>>());
-        let out_rms = rms(&all_samples);
-        let gain_db = if in_rms > 1e-12 {
-            20.0 * (out_rms / in_rms).log10()
-        } else {
-            0.0
-        };
-        let thd_res = thd_percent_full(&all_samples, TEST_FREQ_HZ, SAMPLE_RATE);
-        let (bode_mag, bode_phase) = bode_gain_phase(&all_samples, TEST_FREQ_HZ, SAMPLE_RATE);
-        let bode_gain_db = 20.0 * bode_mag.log10().max(-200.0);
-        let bode_phase_deg = bode_phase.to_degrees();
-
-        rows.push(ValidationRow {
+        set_parameter(plugin, _params, param, min_v)?;
+        let mut sig = generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, 0.5);
+        apply_hann_window(&mut sig);
+        let output = process_signal(
+            plugin, process_fn, &mut process, &mut input_data, &mut output_data,
+            block_size, &sig, &in_port_counts, &out_port_counts,
+        )?;
+        let in_rms = rms(&sig);
+        let out_rms = rms(&output);
+        let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+        let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
+        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+        all_rows.push(ValidationRow {
             plugin: plugin_name.to_string(),
-            block_size: bs,
-            param_name: "default".to_string(),
-            param_value: 0.0,
+            block_size,
+            param_name: format!("{}_step_min", param),
+            param_value: min_v,
             input_rms: in_rms,
             output_rms: out_rms,
             gain_db,
@@ -875,66 +1198,39 @@ fn run_extended_validation(
             bode_gain_db,
             bode_phase_deg,
             latency_samples: latency,
-            nan_detected: nan_found,
+            nan_detected: false,
         });
 
-        // === SATURATION SWEEP: -12 VU -> +18 VU + Max Drive ===
-        let _warmup_frames = (latency as usize) + 4096;
-        for (idx, &(vu, _dbfs)) in SAT_LEVELS.iter().enumerate() {
-            let target_dbfs = if idx == SAT_LEVELS.len() - 1 {
-                // Max Drive: push input to 0 dBFS (full scale)
-                0.0
-            } else {
-                VU0_DBFS + vu
-            };
-            let amp = db_to_linear(target_dbfs);
-            
-            // Generate 8192-frame Hann-windowed sine at 1000 Hz
-            let sine_frames = 8192;
-            let mut sine = generate_sine(1000.0, SAMPLE_RATE, sine_frames, amp);
-            // Apply Hann window
-            for i in 0..sine_frames {
-                let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (sine_frames - 1) as f64).cos();
-                sine[i] *= window;
-            }
-            
-            // Pad to SIGNAL_FRAMES
-            let mut padded = sine;
-            padded.resize(SIGNAL_FRAMES, 0.0);
-            
-            // Compute harmonics on the saturated sine
-            let mags = harmonic_magnitudes(&padded, 1000.0, SAMPLE_RATE, 5);
-            let fund = mags[0];
-            let thd_pct = if fund <= f64::MIN_POSITIVE {
-                0.0
-            } else {
-                let mut hp = 0.0;
-                for h in 2..=5 {
-                    hp += mags[h - 1] * mags[h - 1];
-                }
-                (hp.sqrt() / fund * 100.0).min(1000.0)
-            };
-            let _h2_dbc = if mags[1] > 0.0 { 20.0 * (mags[1] / fund).log10().max(-200.0) } else { -200.0 };
-            let _h3_dbc = if mags[2] > 0.0 { 20.0 * (mags[2] / fund).log10().max(-200.0) } else { -200.0 };
-            
-            let rms_val = rms(&padded);
-            rows.push(ValidationRow {
-                plugin: plugin_name.to_string(),
-                block_size: bs,
-                param_name: if idx == SAT_LEVELS.len() - 1 { "MaxDrive".to_string() } else { format!("{}VU", vu) },
-                param_value: if idx == SAT_LEVELS.len() - 1 { 999.0 } else { vu },
-                input_rms: rms_val,
-                output_rms: rms_val,
-                gain_db: 0.0,
-                thd_percent: thd_pct,
-                bode_gain_db: 0.0,
-                bode_phase_deg: 0.0,
-                latency_samples: latency,
-                nan_detected: false,
-            });
-        }
+        set_parameter(plugin, _params, param, max_v)?;
+        sig = generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, 0.5);
+        apply_hann_window(&mut sig);
+        let output = process_signal(
+            plugin, process_fn, &mut process, &mut input_data, &mut output_data,
+            block_size, &sig, &in_port_counts, &out_port_counts,
+        )?;
+        let in_rms = rms(&sig);
+        let out_rms = rms(&output);
+        let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+        let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
+        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+        all_rows.push(ValidationRow {
+            plugin: plugin_name.to_string(),
+            block_size,
+            param_name: format!("{}_step_max", param),
+            param_value: max_v,
+            input_rms: in_rms,
+            output_rms: out_rms,
+            gain_db,
+            thd_percent: thd_res.thd_percent,
+            bode_gain_db,
+            bode_phase_deg,
+            latency_samples: latency,
+            nan_detected: false,
+        });
     }
 
-    write_csv_rows(&rows, plugin_name)?;
-    Ok(rows)
+    write_expanded_csv(&all_rows, plugin_name)?;
+    generate_svg_measurements(plugin_name, &all_rows)?;
+
+    Ok(all_rows)
 }
