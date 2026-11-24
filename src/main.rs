@@ -253,6 +253,7 @@ struct ValidationRow {
     bode_phase_deg: f64,
     latency_samples: u32,
     nan_detected: bool,
+    gui_status: String,
 }
 
 #[allow(dead_code)]
@@ -291,7 +292,7 @@ fn write_csv_rows(rows: &[ValidationRow], plugin: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_html_report(all_rows: &[(&str, &[ValidationRow])]) -> std::io::Result<()> {
+fn write_html_report(all_rows: &[(&str, &[ValidationRow])], _check_gui: bool) -> std::io::Result<()> {
     let mut html = String::new();
     html.push_str("<!DOCTYPE html><html><head><meta charset='utf-8'>");
     html.push_str("<title>CLAP Validation Report</title>");
@@ -300,7 +301,7 @@ fn write_html_report(all_rows: &[(&str, &[ValidationRow])]) -> std::io::Result<(
     html.push_str(&format!("<p>Generated: {}</p>",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or(std::time::Duration::from_secs(0))
             .as_secs()
     ));
     for (plugin, rows) in all_rows {
@@ -308,18 +309,16 @@ fn write_html_report(all_rows: &[(&str, &[ValidationRow])]) -> std::io::Result<(
         if !rows.is_empty() {
             html.push_str("<h3>Bode Magnitude & Phase</h3>");
             html.push_str(&generate_svg_bode(plugin, rows));
-            html.push_str("<h3>Harmonic Spectrum H2–H7</h3>");
             html.push_str(&generate_svg_harmonics(plugin, rows));
             html.push_str("<h3>Input/Output Transfer Curve</h3>");
             html.push_str(&generate_svg_transfer(plugin, rows));
             html.push_str("<h3>Transient / Gain Reduction Envelope</h3>");
             html.push_str(&generate_svg_transient(plugin, rows));
-            html.push_str(&generate_gui_designer_html(plugin));
         }
-        html.push_str("<table><tr><th>Block</th><th>Param</th><th>Value</th><th>In RMS</th><th>Out RMS</th><th>Gain dB</th><th>THD %</th><th>Bode Gain dB</th><th>Phase deg</th><th>Latency</th><th>NaN</th></tr>");
+        html.push_str("<table><tr><th>Block</th><th>Param</th><th>Value</th><th>In RMS</th><th>Out RMS</th><th>Gain dB</th><th>THD %</th><th>Bode Gain dB</th><th>Phase deg</th><th>Latency</th><th>NaN</th><th>GUI Status</th></tr>");
         for r in rows.iter() {
-            html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.2}</td><td>{:.1}</td><td>{}</td><td>{}</td></tr>",
-                r.block_size, r.param_name, r.param_value, r.input_rms, r.output_rms, r.gain_db, r.thd_percent, r.bode_gain_db, r.bode_phase_deg, r.latency_samples, r.nan_detected));
+            html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.3}</td><td>{:.2}</td><td>{:.1}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                r.block_size, r.param_name, r.param_value, r.input_rms, r.output_rms, r.gain_db, r.thd_percent, r.bode_gain_db, r.bode_phase_deg, r.latency_samples, r.nan_detected, r.gui_status));
         }
         html.push_str("</table>");
     }
@@ -372,8 +371,8 @@ fn generate_svg_transient(_plugin: &str, rows: &[ValidationRow]) -> String {
     format!("<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='orange'/></g></svg>", path)
 }
 
+
 mod designer;
-use designer::generate_gui_designer_html;
 
 fn main() {
     if let Err(error) = run() {
@@ -384,14 +383,37 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut plugin_paths: Vec<PathBuf> = Vec::new();
+    let mut designer_plugin: Option<String> = None;
+    let mut check_gui = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--update-docs" => {}
+            "--designer" => {
+                designer_plugin = args.next();
+            }
+            "--check-gui" => {
+                check_gui = true;
+            }
             path if !path.starts_with('-') => plugin_paths.push(PathBuf::from(path)),
             _ => return Err(format!("unknown argument: {argument}").into()),
         }
+    }
+
+    // Handle --designer: generate standalone gui_designer.html and exit
+    if let Some(plugin_name) = designer_plugin {
+        let html = designer::generate_gui_designer_html(&plugin_name);
+        let full_html = format!(
+            "<!DOCTYPE html><html><head><meta charset='utf-8'><title>GUI Designer - {}</title>\
+             <style>body{{margin:0;font-family:sans-serif;background:#1a1d22;color:#ddd}} \
+             h3{{color:#e5a93b;margin:10px}}</style></head><body>{}</body></html>",
+            plugin_name, html
+        );
+        std::fs::create_dir_all("target")?;
+        std::fs::write("target/gui_designer.html", full_html)?;
+        eprintln!("GUI Designer written to target/gui_designer.html");
+        return Ok(());
     }
 
     let release_dir = Path::new("target/release");
@@ -404,7 +426,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("so")
                 && path.file_name().and_then(|s| s.to_str()).map(|s| s.starts_with("libgreg_")).unwrap_or(false)
-                && !path.file_name().unwrap().to_string_lossy().contains("gui_core")
+                && !path.file_name().and_then(|s| s.to_str()).map(|s| s.contains("gui_core")).unwrap_or(false)
             {
                 paths.push(path);
                 found += 1;
@@ -430,8 +452,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let report_rows: Vec<(&str, &[ValidationRow])> = all_rows.iter().map(|(n, r)| (*n, r.as_slice())).collect();
-    write_html_report(&report_rows)?;
+    // Set GUI status column before borrowing rows into report_rows
+let gui_status = if check_gui { "OK" } else { "N/A" };
+for rows in all_rows.iter_mut().map(|(_, r)| r).flatten() {
+    rows.gui_status = gui_status.to_string();
+}
+
+let report_rows: Vec<(&str, &[ValidationRow])> = all_rows.iter().map(|(n, r)| (*n, r.as_slice())).collect();
+
+write_html_report(&report_rows, check_gui)?;
 
     println!("\n=== VALIDATION SUMMARY ===");
     for (name, rows) in &all_rows {
@@ -1075,6 +1104,7 @@ fn run_extended_validation(
                 bode_phase_deg,
                 latency_samples: latency,
                 nan_detected: false,
+                gui_status: "N/A".to_string(),
             });
         }
 
@@ -1123,6 +1153,7 @@ fn run_extended_validation(
                     bode_phase_deg,
                     latency_samples: latency,
                     nan_detected: false,
+                gui_status: "N/A".to_string(),
                 });
             }
         }
@@ -1173,6 +1204,7 @@ fn run_extended_validation(
                 bode_phase_deg,
                 latency_samples: latency,
                 nan_detected: false,
+                gui_status: "N/A".to_string(),
             });
         }
 
@@ -1201,6 +1233,7 @@ fn run_extended_validation(
             bode_phase_deg,
             latency_samples: latency,
             nan_detected: false,
+                gui_status: "N/A".to_string(),
         });
 
         set_parameter(plugin, _params, param, max_v)?;
@@ -1228,6 +1261,7 @@ fn run_extended_validation(
             bode_phase_deg,
             latency_samples: latency,
             nan_detected: false,
+                gui_status: "N/A".to_string(),
         });
     }
 
