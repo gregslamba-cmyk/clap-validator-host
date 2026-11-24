@@ -598,12 +598,14 @@ fn set_parameter(
     let count = unsafe { params.count.expect("parameter count callback missing")(plugin) };
     let get_info = params.get_info.expect("parameter info callback missing");
     let mut parameter_id = None;
+    let mut param_cookie: *mut c_void = ptr::null_mut();
     for index in 0..count {
         let mut info = empty_param_info();
         if unsafe { get_info(plugin, index, &mut info) } {
             let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
             if name == parameter_name {
                 parameter_id = Some(info.id);
+                param_cookie = info.cookie;
                 break;
             }
         }
@@ -619,7 +621,7 @@ fn set_parameter(
         },
         key: 0,
         param_id: parameter_id,
-        cookie: ptr::null_mut(),
+        cookie: param_cookie,
         note_id: -1,
         port_index: -1,
         channel: -1,
