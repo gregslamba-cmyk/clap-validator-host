@@ -588,8 +588,22 @@ fn empty_output_events() -> clap_output_events {
     }
 }
 
-unsafe extern "C" fn input_event_size(_events: *const clap_input_events) -> u32 { 0 }
-unsafe extern "C" fn input_event_get(_events: *const clap_input_events, _index: u32) -> *const clap_event_header { ptr::null() }
+unsafe extern "C" fn input_event_size(events: *const clap_input_events) -> u32 {
+    // Return 1 when ctx holds a valid event pointer (set_parameter path),
+    // 0 when ctx is null (empty_input_events path used in process loop).
+    unsafe {
+        if !events.is_null() && !(*events).ctx.is_null() { 1 } else { 0 }
+    }
+}
+unsafe extern "C" fn input_event_get(events: *const clap_input_events, index: u32) -> *const clap_event_header {
+    unsafe {
+        if !events.is_null() && index == 0 && !(*events).ctx.is_null() {
+            (*events).ctx as *const clap_event_header
+        } else {
+            ptr::null()
+        }
+    }
+}
 unsafe extern "C" fn accept_output_event(_events: *const clap_output_events, _event: *const clap_event_header) -> bool { true }
 
 fn extension<T: Copy>(
@@ -628,6 +642,8 @@ fn set_parameter(
     let get_info = params.get_info.expect("parameter info callback missing");
     let mut parameter_id = None;
     let mut param_cookie: *mut c_void = ptr::null_mut();
+    let mut param_min = 0.0_f64;
+    let mut param_max = 1.0_f64;
     for index in 0..count {
         let mut info = empty_param_info();
         if unsafe { get_info(plugin, index, &mut info) } {
@@ -635,11 +651,22 @@ fn set_parameter(
             if name == parameter_name {
                 parameter_id = Some(info.id);
                 param_cookie = info.cookie;
+                param_min = info.min_value;
+                param_max = info.max_value;
                 break;
             }
         }
     }
     let parameter_id = parameter_id.ok_or_else(|| format!("parameter not found: {parameter_name}"))?;
+
+    // nih_plug CLAP wrapper expects normalized [0.0, 1.0] values in events.
+    // Map the native-range value to normalized before sending.
+    let normalized_value = if (param_max - param_min).abs() > f64::EPSILON {
+        ((value - param_min) / (param_max - param_min)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
     let event = clap_event_param_value {
         header: clap_event_header {
             size: size_of::<clap_event_param_value>() as u32,
@@ -654,7 +681,7 @@ fn set_parameter(
         note_id: -1,
         port_index: -1,
         channel: -1,
-        value,
+        value: normalized_value,
     };
     let events = clap_input_events {
         ctx: (&event as *const clap_event_param_value).cast_mut().cast(),
@@ -668,10 +695,10 @@ fn set_parameter(
     let mut current_value = 0.0;
     if let Some(get_value) = params.get_value
         && unsafe { get_value(plugin, parameter_id, &mut current_value) }
-        && (current_value - value).abs() > 1.0e-6
+        && (current_value - normalized_value).abs() > 1.0e-6
     {
         // Parameter did not accept the requested value; log and continue.
-        eprintln!("  [warn] parameter {parameter_name} did not accept {value}; current value is {current_value}");
+        eprintln!("  [warn] parameter {parameter_name} did not accept {value} (normalized {normalized_value:.4}); current value is {current_value}");
     }
     Ok(())
 }
