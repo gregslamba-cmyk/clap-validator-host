@@ -648,6 +648,7 @@ fn set_parameter(
     let mut param_cookie: *mut c_void = ptr::null_mut();
     let mut param_min = 0.0_f64;
     let mut param_max = 1.0_f64;
+    let mut param_flags: u32 = 0;
     for index in 0..count {
         let mut info = empty_param_info();
         if unsafe { get_info(plugin, index, &mut info) } {
@@ -657,6 +658,7 @@ fn set_parameter(
                 param_cookie = info.cookie;
                 param_min = info.min_value;
                 param_max = info.max_value;
+                param_flags = info.flags;
                 break;
             }
         }
@@ -665,7 +667,13 @@ fn set_parameter(
 
     // nih_plug CLAP wrapper expects normalized [0.0, 1.0] values in events.
     // Map the native-range value to normalized before sending.
-    let normalized_value = if (param_max - param_min).abs() > f64::EPSILON {
+    let is_discrete_param = (param_flags & CLAP_PARAM_IS_STEPPED) != 0
+        || (param_flags & CLAP_PARAM_IS_ENUM) != 0;
+    let normalized_value = if is_discrete_param {
+        // Discrete/stepped parameters use step indices (0, 1, 2, ...) as values.
+        let step_count = ((param_max - param_min).round() + 1.0).max(1.0);
+        ((value - param_min).round().clamp(0.0, step_count - 1.0)) as u64 as f64
+    } else if (param_max - param_min).abs() > f64::EPSILON {
         ((value - param_min) / (param_max - param_min)).clamp(0.0, 1.0)
     } else {
         0.0
