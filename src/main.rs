@@ -3,6 +3,13 @@
 //! 6 calibrated signals, static + dynamic parameter automation,
 //! HTML+SVG report with GUI Layout Designer Drag & Drop, CSV output.
 
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::map_flatten)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::unnecessary_conversion)]
+#![allow(rustdoc::doc_list_item_overindented)]
+
 use std::ffi::{CStr, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -152,9 +159,9 @@ fn generate_dynamic_burst(sample_rate: f64, frames: usize) -> Vec<f64> {
 fn apply_hann_window(samples: &mut [f64]) {
     let n = samples.len();
     if n <= 1 { return; }
-    for i in 0..n {
+    for (i, _) in samples.iter_mut().enumerate().take(n) {
         let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos();
-        samples[i] *= window;
+        *samples[i] *= window;
     }
 }
 
@@ -196,7 +203,7 @@ fn bode_from_fft(_input: &[f64], output: &[f64], sample_rate: f64, latency_sampl
     let (mag, phase) = goertzel_complex(output, TEST_FREQ_HZ, sample_rate);
     let gain_db = 20.0 * mag.log10().max(-200.0);
     let phase_deg = (phase * 180.0 / std::f64::consts::PI)
-        - (TEST_FREQ_HZ as f64 / sample_rate * 360.0 * latency_samples as f64).rem_euclid(360.0);
+        - (TEST_FREQ_HZ / sample_rate * 360.0 * latency_samples).rem_euclid(360.0);
     (gain_db, phase_deg)
 }
 
@@ -263,7 +270,7 @@ struct ValidationRow {
 #[allow(dead_code)]
 fn write_csv_rows(rows: &[ValidationRow], plugin: &str) -> std::io::Result<()> {
     let dir = Path::new(VALIDATION_DATA_DIR_STR);
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
