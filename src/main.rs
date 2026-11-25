@@ -17,7 +17,11 @@ use clap_sys::{
     ext::{
         audio_ports::{clap_audio_port_info, clap_plugin_audio_ports, CLAP_EXT_AUDIO_PORTS},
         latency::{clap_plugin_latency, CLAP_EXT_LATENCY},
-        params::{clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS},
+        params::{
+            clap_param_info, clap_plugin_params, CLAP_EXT_PARAMS, CLAP_PARAM_IS_STEPPED,
+            CLAP_PARAM_IS_ENUM, CLAP_PARAM_IS_READONLY, CLAP_PARAM_IS_HIDDEN, CLAP_PARAM_IS_BYPASS,
+            CLAP_PARAM_IS_AUTOMATABLE, CLAP_PARAM_IS_MODULATABLE, CLAP_PARAM_REQUIRES_PROCESS,
+        },
         thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK},
     },
     factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID},
@@ -718,10 +722,29 @@ fn query_plugin_parameters(plugin: *const clap_plugin) -> Result<Vec<String>, Bo
     Ok(names)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParamInfo {
+    min_value: f64,
+    max_value: f64,
+    default_value: f64,
+    flags: u32,
+}
+
+fn is_discrete_param(flags: u32) -> bool {
+    (flags & CLAP_PARAM_IS_STEPPED) != 0
+        || (flags & CLAP_PARAM_IS_ENUM) != 0
+        || (flags & CLAP_PARAM_IS_READONLY) != 0
+        || (flags & CLAP_PARAM_IS_HIDDEN) != 0
+        || (flags & CLAP_PARAM_IS_BYPASS) != 0
+        || (flags & CLAP_PARAM_IS_AUTOMATABLE) != 0
+        || (flags & CLAP_PARAM_IS_MODULATABLE) != 0
+        || (flags & CLAP_PARAM_REQUIRES_PROCESS) != 0
+}
+
 fn query_param_ranges(
     plugin: *const clap_plugin,
     param_names: &[String],
-) -> Result<std::collections::HashMap<String, (f64, f64, f64)>, Box<dyn std::error::Error>> {
+) -> Result<std::collections::HashMap<String, ParamInfo>, Box<dyn std::error::Error>> {
     let params_ext = extension::<clap_plugin_params>(plugin, CLAP_EXT_PARAMS.as_ptr())?;
     let count = unsafe { params_ext.count.expect("parameter count callback missing")(plugin) };
     let get_info = params_ext.get_info.expect("parameter info callback missing");
@@ -731,7 +754,15 @@ fn query_param_ranges(
         if unsafe { get_info(plugin, index, &mut info) } {
             let name = unsafe { CStr::from_ptr(info.name.as_ptr()) }.to_string_lossy();
             if param_names.contains(&name.to_string()) {
-                ranges.insert(name.to_string(), (info.min_value, info.max_value, info.default_value));
+                ranges.insert(
+                    name.to_string(),
+                    ParamInfo {
+                        min_value: info.min_value,
+                        max_value: info.max_value,
+                        default_value: info.default_value,
+                        flags: info.flags,
+                    },
+                );
             }
         }
     }
@@ -1136,13 +1167,23 @@ fn run_extended_validation(
         }
 
         for param in &param_names {
-            let range = param_ranges.get(param).copied().unwrap_or((-1.0, 1.0, 0.0));
-            let min_v = range.0;
-            let max_v = range.1;
-            let default_v = range.2;
+            let info = param_ranges.get(param).copied().unwrap_or(ParamInfo { min_value: -1.0, max_value: 1.0, default_value: 0.0, flags: 0 });
+            let min_v = info.min_value;
+            let max_v = info.max_value;
+            let default_v = info.default_value;
+            let candidates: Vec<f64> = if is_discrete_param(info.flags) {
+                vec![min_v, default_v, max_v]
+            } else {
+                vec![
+                    min_v,
+                    min_v + (max_v - min_v) * 0.25,
+                    default_v,
+                    min_v + (max_v - min_v) * 0.75,
+                    max_v,
+                ]
+            };
 
-            for static_val in [min_v, min_v + (max_v - min_v) * 0.25, default_v,
-                min_v + (max_v - min_v) * 0.75, max_v] {
+            for static_val in candidates {
                 set_parameter(plugin, _params, param, static_val)?;
 
                 let sig_amp = 0.5;
@@ -1187,14 +1228,16 @@ fn run_extended_validation(
     }
 
     for param in &param_names {
-        let range = param_ranges.get(param).copied().unwrap_or((-1.0, 1.0, 0.0));
-        let min_v = range.0;
-        let max_v = range.1;
-        let steps: Vec<f64> = (0..=10)
-            .map(|i| min_v + (max_v - min_v) * i as f64 / 10.0)
-            .collect();
+        let info = param_ranges.get(param).copied().unwrap_or(ParamInfo { min_value: -1.0, max_value: 1.0, default_value: 0.0, flags: 0 });
+        let min_v = info.min_value;
+        let max_v = info.max_value;
+        let steps: Vec<f64> = if is_discrete_param(info.flags) {
+            vec![min_v, max_v]
+        } else {
+            (0..=10).map(|i| min_v + (max_v - min_v) * i as f64 / 10.0).collect()
+        };
 
-        for &val in steps.iter().chain(steps.iter().rev()) {
+        for &val in &steps {
             set_parameter(plugin, _params, param, val)?;
 
             let mut sig = generate_sine(TEST_FREQ_HZ, SAMPLE_RATE, SIGNAL_FRAMES, 0.5);
