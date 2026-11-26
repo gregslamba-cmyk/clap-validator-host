@@ -7,7 +7,6 @@
 #![allow(clippy::map_flatten)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::doc_lazy_continuation)]
-#![allow(rustdoc::doc_list_item_overindented)]
 
 use std::ffi::{CStr, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
