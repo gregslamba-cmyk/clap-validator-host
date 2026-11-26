@@ -881,6 +881,7 @@ fn generate_svg_measurements(plugin_name: &str, rows: &[ValidationRow]) -> std::
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_signal(
     plugin: *const clap_sys::plugin::clap_plugin,
     process_fn: unsafe extern "C" fn(*const clap_sys::plugin::clap_plugin, *const clap_sys::process::clap_process) -> clap_sys::process::clap_process_status,
@@ -912,7 +913,7 @@ fn process_signal(
 
         let status = unsafe { process_fn(plugin, process as *mut _) };
         if status == clap_sys::process::CLAP_PROCESS_ERROR {
-            return Err(format!("process returned error at sample {}", pos).into());
+            return Err(format!("process returned error at sample {}", pos));
         }
 
         for (port_idx, &ch_count) in out_port_counts.iter().enumerate() {
@@ -922,7 +923,7 @@ fn process_signal(
                     if base + i < output_data[port_idx].len() {
                         let s = output_data[port_idx][base + i] as f64;
                         if s.is_nan() || s.is_infinite() {
-                            return Err(format!("NaN/Inf at sample {}/ch{}", pos + i, ch).into());
+                            return Err(format!("NaN/Inf at sample {}/ch{}", pos + i, ch));
                         }
                         all_output.push(s);
                     }
@@ -953,8 +954,8 @@ fn warm_up(
         process.frames_count = bs as u32;
 
         for input in input_data.iter_mut() {
-            for i in 0..bs {
-                input[i] = 0.0;
+            for x in input.iter_mut().take(bs) {
+                *x = 0.0;
             }
         }
 
@@ -963,8 +964,8 @@ fn warm_up(
         }
 
         for output in output_data.iter_mut() {
-            for i in 0..bs {
-                output[i] = 0.0;
+            for x in output.iter_mut().take(bs) {
+                *x = 0.0;
             }
         }
 
