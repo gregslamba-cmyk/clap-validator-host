@@ -209,8 +209,12 @@ fn goertzel_complex(samples: &[f64], freq_hz: f64, sample_rate: f64) -> (f64, f6
 }
 
 fn bode_from_fft(_input: &[f64], output: &[f64], sample_rate: f64, latency_samples: u32) -> (f64, f64) {
+    // Compute input/output magnitudes for gain (ratio in dB). Clamp ratio before log10 to avoid -inf.
+    let in_mag = _input.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    let out_mag = output.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    let ratio = out_mag / in_mag.max(1e-10); // P1-3.5: clamp ratio before log10
     let (mag, phase) = goertzel_complex(output, TEST_FREQ_HZ, sample_rate);
-    let gain_db = 20.0 * mag.log10().max(-200.0);
+    let gain_db = 20.0 * ratio.log10();
     let phase_deg = (phase * 180.0 / std::f64::consts::PI)
         - (TEST_FREQ_HZ / sample_rate * 360.0 * (latency_samples as f64)).rem_euclid(360.0);
     (gain_db, phase_deg)
@@ -220,6 +224,12 @@ fn rms(samples: &[f64]) -> f64 {
     if samples.is_empty() { return 0.0; }
     let sum: f64 = samples.iter().map(|&x| x * x).sum();
     (sum / samples.len() as f64).sqrt()
+}
+
+/// Rilevamento reale di `NaN`/`Inf` sui campioni di uscita del plugin.
+/// Usato per popolare il campo `nan_detected` delle righe di validazione.
+fn has_nan_or_inf(samples: &[f64]) -> bool {
+    samples.iter().any(|&x| !x.is_finite())
 }
 
 fn empty_audio_port_info() -> clap_audio_port_info {
@@ -1214,7 +1224,7 @@ fn run_extended_validation(
 
             let in_rms = rms(signal_samples);
             let out_rms = rms(&output);
-            let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+            let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
 
             let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
             let (bode_gain_db, bode_phase_deg) = bode_from_fft(signal_samples, &output, SAMPLE_RATE, latency);
@@ -1231,7 +1241,7 @@ fn run_extended_validation(
                 bode_gain_db,
                 bode_phase_deg,
                 latency_samples: latency,
-                nan_detected: false,
+                nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
             });
         }
@@ -1274,7 +1284,7 @@ fn run_extended_validation(
 
                 let in_rms = rms(&sig);
                 let out_rms = rms(&output);
-                let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+                let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
                 let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
                 let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
 
@@ -1290,7 +1300,7 @@ fn run_extended_validation(
                     bode_gain_db,
                     bode_phase_deg,
                     latency_samples: latency,
-                    nan_detected: false,
+                    nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
                 });
             }
@@ -1327,7 +1337,7 @@ fn run_extended_validation(
 
             let in_rms = rms(&sig);
             let out_rms = rms(&output);
-            let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+            let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
             let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
             let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
 
@@ -1343,7 +1353,7 @@ fn run_extended_validation(
                 bode_gain_db,
                 bode_phase_deg,
                 latency_samples: latency,
-                nan_detected: false,
+                nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
             });
         }
@@ -1357,7 +1367,7 @@ fn run_extended_validation(
         )?;
         let in_rms = rms(&sig);
         let out_rms = rms(&output);
-        let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+        let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
         let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
         let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
         all_rows.push(ValidationRow {
@@ -1372,7 +1382,7 @@ fn run_extended_validation(
             bode_gain_db,
             bode_phase_deg,
             latency_samples: latency,
-            nan_detected: false,
+            nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
         });
 
@@ -1385,7 +1395,7 @@ fn run_extended_validation(
         )?;
         let in_rms = rms(&sig);
         let out_rms = rms(&output);
-        let gain_db = 20.0 * (out_rms / in_rms).log10().max(-200.0);
+        let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
         let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
         let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
         all_rows.push(ValidationRow {
@@ -1400,7 +1410,7 @@ fn run_extended_validation(
             bode_gain_db,
             bode_phase_deg,
             latency_samples: latency,
-            nan_detected: false,
+            nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
         });
     }
