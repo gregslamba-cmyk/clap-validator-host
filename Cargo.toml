@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 core-dsp = { path = "../../core-dsp" }
 clap-sys = { git = "https://github.com/micahrj/clap-sys.git", rev = "25d7f53fdb6363ad63fbd80049cb7a42a97ac156" }
+clap-sys-wrapper = { path = "../clap-sys-wrapper" }
 libc = "0.2"
 libloading = "0.7.4"
 realfft = "3.5"
