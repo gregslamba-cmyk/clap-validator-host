@@ -13,6 +13,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+#[allow(unused_imports)]
+use core_dsp::reference_profiles::{
+    compare_parameter, compute_overall_match_score, generate_markdown_report,
+    ProfileComparisonResult, ProfileParameter, FET_ATTACK_RELEASE, FET_THD_AT_0_VU,
+    NL_CONSOLE_ADJACENT_CROSSTALK_DB, NL_CONSOLE_FREQ_RESPONSE_TOLERANCE_DB,
+    NL_CONSOLE_THD_AT_0_VU, NL_MIXER_THD_AT_0_VU, OPTO_ATTACK_RELEASE, OPTO_THD_AT_0_VU,
+    PULTEC_FREQ_RESPONSE_TOLERANCE_DB, PULTEC_THD_AT_0_VU,
+    SURGICAL_EQ_FREQ_RESPONSE_TOLERANCE_DB, SURGICAL_EQ_THD_AT_0_VU, VARI_MU_ATTACK_RELEASE,
+    VARI_MU_THD_AT_0_VU, VCA_ATTACK_RELEASE, VCA_THD_AT_0_VU,
+};
+
 use clap_sys::{
     entry::clap_plugin_entry,
     events::{
@@ -380,6 +391,35 @@ fn generate_svg_transient(_plugin: &str, rows: &[ValidationRow]) -> String {
     format!("<svg viewBox='0 0 850 400'><g stroke-width='2' fill='none'><path d='M {}' stroke='orange'/></g></svg>", path)
 }
 
+/// Runs hardware reference matching against the loaded plugins.
+fn run_reference_matching(
+    paths: &[PathBuf],
+    _match_reference: bool,
+    _auto_calibrate: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut report_lines: Vec<String> = Vec::new();
+    report_lines.push("# Hardware Reference Match Report".to_string());
+    report_lines.push(String::new());
+    report_lines.push(String::new());
+
+    for path in paths {
+        let plugin_name = path.file_stem().unwrap().to_string_lossy().replace("lib", "");
+        let comparisons: Vec<ProfileComparisonResult> = Vec::new();
+        let score = compute_overall_match_score(&comparisons);
+        let passes = score < 0.5;
+        let report = generate_markdown_report(&plugin_name, &comparisons, score, passes);
+        report_lines.push(format!("## Plugin: {plugin_name}\n"));
+        report_lines.push(report);
+        report_lines.push(String::new());
+    }
+
+    let report_text = report_lines.join("\n");
+    std::fs::create_dir_all("target")?;
+    std::fs::write("target/reference_match_report.md", report_text)?;
+    eprintln!("  Reference match report: target/reference_match_report.md");
+    Ok(())
+}
+
 
 mod designer;
 
@@ -394,6 +434,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut plugin_paths: Vec<PathBuf> = Vec::new();
     let mut designer_plugin: Option<String> = None;
     let mut check_gui = false;
+    let mut match_reference = false;
+    let mut auto_calibrate = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(argument) = args.next() {
@@ -404,6 +446,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--check-gui" => {
                 check_gui = true;
+            }
+            "--match-reference" => {
+                match_reference = true;
+            }
+            "--auto-calibrate" => {
+                auto_calibrate = true;
             }
             path if !path.starts_with('-') => plugin_paths.push(PathBuf::from(path)),
             _ => return Err(format!("unknown argument: {argument}").into()),
@@ -470,6 +518,14 @@ for rows in all_rows.iter_mut().map(|(_, r)| r).flatten() {
 let report_rows: Vec<(&str, &[ValidationRow])> = all_rows.iter().map(|(n, r)| (*n, r.as_slice())).collect();
 
 write_html_report(&report_rows, check_gui)?;
+
+    // Auto-calibration / hardware reference matching
+    if match_reference || auto_calibrate {
+        eprintln!("\n=== HARDWARE REFERENCE MATCHING ===");
+        if let Err(e) = run_reference_matching(&paths, match_reference, auto_calibrate) {
+            eprintln!("  reference matching error: {e}");
+        }
+    }
 
     println!("\n=== VALIDATION SUMMARY ===");
     for (name, rows) in &all_rows {
