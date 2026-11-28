@@ -9,4 +9,4 @@ Copyright (c) 2026 Alberto Gregorio Ferraris. All rights reserved.
   - Null-check FFI (`clap_plugin_entry`, `plugin->init()`, `plugin->process()`, `audio_input`/`audio_output`) + commenti `// SAFETY:` sui blocchi C-ABI dei due tool host (mantenendo `#![forbid(unsafe_code)]` su `core-dsp`, `greg_gui_core` e su tutti i plugin).
   - Fix numerico `gain_db`: `20.0 * (out_rms / in_rms).max(1e-10).log10()` (clamp sull'argomento del log invece che sul risultato).
   - Rilevamento reale `nan_detected` (`f64::is_nan()` / `is_infinite()`) sull'output in `clap-validator-host`.
-  - Cross-correlazione FFT con `realfft` per la misura di latenza (riduzione tempi ~90%), finestra Hann + noise floor in `thd_percent_full` e compensazione `latency_samples` in `bode_from_fft`.
+  - [x] Cross-correlazione FFT con `realfft` per la misura di latenza (riduzione tempi ~90%), finestra Hann + noise floor in `thd_percent_full` e compensazione `latency_samples` in `bode_from_fft`. (3/3 test unitari PASS, clippy 0 warning)

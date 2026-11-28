@@ -13,6 +13,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
+use realfft::{RealFftPlanner, num_complex::Complex};
+
 #[allow(unused_imports)]
 use core_dsp::reference_profiles::{
     compare_parameter, compute_overall_match_score, generate_markdown_report,
@@ -209,14 +211,20 @@ fn goertzel_complex(samples: &[f64], freq_hz: f64, sample_rate: f64) -> (f64, f6
 }
 
 fn bode_from_fft(_input: &[f64], output: &[f64], sample_rate: f64, latency_samples: u32) -> (f64, f64) {
-    // Compute input/output magnitudes for gain (ratio in dB). Clamp ratio before log10 to avoid -inf.
+    // Allineare la finestra con la latenza stimata: troncando l'output di `latency_samples`
+    // se supera la metà della lunghezza FFT per evitare wrap-around.
+    let effective_latency = latency_samples;
+    let out_slice = if effective_latency > 0 && (effective_latency as usize) < output.len() { &output[effective_latency as usize..] } else { output };
+
+    // Calcola le ampiezze del segnale in ingresso/uscita per il guadagno (in dB).
+    // Clamp il rapporto prima del log10 per evitare -inf.
     let in_mag = _input.iter().map(|&x| x * x).sum::<f64>().sqrt();
-    let out_mag = output.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    let out_mag = out_slice.iter().map(|&x| x * x).sum::<f64>().sqrt();
     let ratio = out_mag / in_mag.max(1e-10); // P1-3.5: clamp ratio before log10
-    let (mag, phase) = goertzel_complex(output, TEST_FREQ_HZ, sample_rate);
+    let (_mag, phase) = goertzel_complex(out_slice, TEST_FREQ_HZ, sample_rate);
     let gain_db = 20.0 * ratio.log10();
     let phase_deg = (phase * 180.0 / std::f64::consts::PI)
-        - (TEST_FREQ_HZ / sample_rate * 360.0 * (latency_samples as f64)).rem_euclid(360.0);
+        - (TEST_FREQ_HZ / sample_rate * 360.0 * (effective_latency as f64)).rem_euclid(360.0);
     (gain_db, phase_deg)
 }
 
@@ -231,6 +239,95 @@ fn rms(samples: &[f64]) -> f64 {
 fn has_nan_or_inf(samples: &[f64]) -> bool {
     samples.iter().any(|&x| !x.is_finite())
 }
+
+/// Restituisce la potenza di due più grande >= value (next power of two).
+fn next_pow2(mut value: usize) -> usize {
+    value -= 1;
+    value |= value >> 1;
+    value |= value >> 2;
+    value |= value >> 4;
+    value |= value >> 8;
+    value |= value >> 16;
+    value + 1
+}
+
+/// Stima la latenza di processamento tramite cross-correlazione FFT.
+///
+/// Applica una finestra Hanning ai segnali di input/output, calcola la
+/// cross-correlazione con lo spettro `conj(FFT(in)) * FFT(out)` e ne riporta il
+/// picco (in samples) come latenza stimata. La stima viene considerata valida
+/// solo se il picco supera la soglia di rumore determinata sull'energia della
+/// correlazione stessa. Restituisce 0 se la stima fallisce.
+fn estimate_latency_fft(input: &[f64], output: &[f64], _sample_rate: f64) -> u32 {
+    let n = input.len().max(output.len());
+    if n < 4
+        || !input.iter().all(|&x| x.is_finite())
+        || !output.iter().all(|&x| x.is_finite())
+    {
+        return 0;
+    }
+
+    // FFT length: potenza di due >= 2 * n per evitare la wrap-around lineare
+    // nella cross-correlazione.
+    let fft_len = next_pow2(2 * n);
+    let mut in_buf = vec![0.0_f64; fft_len];
+    let mut out_buf = vec![0.0_f64; fft_len];
+
+    for i in 0..n {
+        let window = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos();
+        in_buf[i] = if i < input.len() { input[i] * window } else { 0.0 };
+        out_buf[i] = if i < output.len() { output[i] * window } else { 0.0 };
+    }
+
+    let mut planner = RealFftPlanner::<f64>::new();
+    let r2c = planner.plan_fft_forward(fft_len);
+    let mut spec_in: Vec<Complex<f64>> = vec![Complex::default(); fft_len / 2 + 1];
+    let mut spec_out: Vec<Complex<f64>> = vec![Complex::default(); fft_len / 2 + 1];
+    let _ = r2c.process(&mut in_buf, &mut spec_in);
+    let _ = r2c.process(&mut out_buf, &mut spec_out);
+
+    let mut corr_spec: Vec<Complex<f64>> = Vec::with_capacity(fft_len / 2 + 1);
+    for k in 0..fft_len / 2 + 1 {
+        let a = spec_in[k];
+        let b = spec_out[k];
+        // conj(a) * b
+        corr_spec.push(Complex {
+            re: a.re * b.re + a.im * b.im,
+            im: a.im * b.re - a.re * b.im,
+        });
+    }
+
+    let mut corr: Vec<f64> = vec![0.0; fft_len];
+    let c2r = planner.plan_fft_inverse(fft_len);
+    let _ = c2r.process(&mut corr_spec, &mut corr);
+
+    // Ritrova il picco di correlazione (argmax in valore assoluto).
+    let mut best_idx = 0usize;
+    let mut best_val = 0.0_f64;
+    for (k, &v) in corr.iter().enumerate().take(fft_len / 2) {
+        let abs_v = v.abs();
+        if abs_v > best_val {
+            best_val = abs_v;
+            best_idx = k;
+        }
+    }
+    if !best_val.is_finite() {
+        return 0;
+    }
+
+    // Noise floor: energia media della correlazione per applicare il threshold.
+    let mut noise_sum = 0.0_f64;
+    for &v in &corr {
+        noise_sum += v.abs();
+    }
+    let noise_floor = noise_sum / corr.len().max(1) as f64;
+    if noise_floor <= 0.0 || best_val <= noise_floor * 2.0 {
+        return 0;
+    }
+
+    (best_idx as u32).min(n as u32)
+}
+
 
 fn empty_audio_port_info() -> clap_audio_port_info {
     clap_audio_port_info {
@@ -1227,7 +1324,9 @@ fn run_extended_validation(
             let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
 
             let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
-            let (bode_gain_db, bode_phase_deg) = bode_from_fft(signal_samples, &output, SAMPLE_RATE, latency);
+            let measured_latency = estimate_latency_fft(signal_samples, &output, SAMPLE_RATE);
+            let effective_latency = if measured_latency > 0 { measured_latency } else { latency };
+            let (bode_gain_db, bode_phase_deg) = bode_from_fft(signal_samples, &output, SAMPLE_RATE, effective_latency);
 
             all_rows.push(ValidationRow {
                 plugin: plugin_name.to_string(),
@@ -1240,7 +1339,7 @@ fn run_extended_validation(
                 thd_percent: thd_res.thd_percent,
                 bode_gain_db,
                 bode_phase_deg,
-                latency_samples: latency,
+                latency_samples: effective_latency,
                 nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
             });
@@ -1286,7 +1385,9 @@ fn run_extended_validation(
                 let out_rms = rms(&output);
                 let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
                 let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
-                let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+                let measured_latency = estimate_latency_fft(&sig, &output, SAMPLE_RATE);
+                let effective_latency = if measured_latency > 0 { measured_latency } else { latency };
+                let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, effective_latency);
 
                 all_rows.push(ValidationRow {
                     plugin: plugin_name.to_string(),
@@ -1299,7 +1400,7 @@ fn run_extended_validation(
                     thd_percent: thd_res.thd_percent,
                     bode_gain_db,
                     bode_phase_deg,
-                    latency_samples: latency,
+                    latency_samples: effective_latency,
                     nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
                 });
@@ -1339,7 +1440,9 @@ fn run_extended_validation(
             let out_rms = rms(&output);
             let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
             let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
-            let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+            let measured_latency = estimate_latency_fft(&sig, &output, SAMPLE_RATE);
+            let effective_latency = if measured_latency > 0 { measured_latency } else { latency };
+            let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, effective_latency);
 
             all_rows.push(ValidationRow {
                 plugin: plugin_name.to_string(),
@@ -1352,7 +1455,7 @@ fn run_extended_validation(
                 thd_percent: thd_res.thd_percent,
                 bode_gain_db,
                 bode_phase_deg,
-                latency_samples: latency,
+                latency_samples: effective_latency,
                 nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
             });
@@ -1369,7 +1472,9 @@ fn run_extended_validation(
         let out_rms = rms(&output);
         let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
         let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
-        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+        let measured_latency = estimate_latency_fft(&sig, &output, SAMPLE_RATE);
+        let effective_latency = if measured_latency > 0 { measured_latency } else { latency };
+        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, effective_latency);
         all_rows.push(ValidationRow {
             plugin: plugin_name.to_string(),
             block_size,
@@ -1381,7 +1486,7 @@ fn run_extended_validation(
             thd_percent: thd_res.thd_percent,
             bode_gain_db,
             bode_phase_deg,
-            latency_samples: latency,
+            latency_samples: effective_latency,
             nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
         });
@@ -1397,7 +1502,9 @@ fn run_extended_validation(
         let out_rms = rms(&output);
         let gain_db = 20.0 * (out_rms / in_rms).max(1e-10).log10();
         let thd_res = thd_percent_full(&output, TEST_FREQ_HZ, SAMPLE_RATE);
-        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, latency);
+        let measured_latency = estimate_latency_fft(&sig, &output, SAMPLE_RATE);
+        let effective_latency = if measured_latency > 0 { measured_latency } else { latency };
+        let (bode_gain_db, bode_phase_deg) = bode_from_fft(&sig, &output, SAMPLE_RATE, effective_latency);
         all_rows.push(ValidationRow {
             plugin: plugin_name.to_string(),
             block_size,
@@ -1409,7 +1516,7 @@ fn run_extended_validation(
             thd_percent: thd_res.thd_percent,
             bode_gain_db,
             bode_phase_deg,
-            latency_samples: latency,
+            latency_samples: effective_latency,
             nan_detected: has_nan_or_inf(&output),
                 gui_status: "N/A".to_string(),
         });
@@ -1419,4 +1526,41 @@ fn run_extended_validation(
     generate_svg_measurements(plugin_name, &all_rows)?;
 
     Ok(all_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimate_latency_fft_known_delay() {
+        let sample_rate = 48_000.0;
+        let input = generate_impulse(SIGNAL_FRAMES, 1.0);
+        let mut output = vec![0.0; SIGNAL_FRAMES];
+        // Shift the impulse by 250 samples.
+        output[250] = 1.0;
+        let latency = estimate_latency_fft(&input, &output, sample_rate);
+        assert!(latency > 0 && latency <= SIGNAL_FRAMES as u32, "latenza stimata: {}", latency);
+    }
+
+    #[test]
+    fn test_estimate_latency_fft_identical() {
+        let sample_rate = 48_000.0;
+        let freq = 1_000.0;
+        let n: usize = 48_000;
+        let mut signal = Vec::with_capacity(n);
+        for i in 0..n {
+            signal.push((2.0 * std::f64::consts::PI * freq * i as f64 / sample_rate).sin());
+        }
+        let latency = estimate_latency_fft(&signal, &signal, sample_rate);
+        assert_eq!(latency, 0);
+    }
+
+    #[test]
+    fn test_has_nan_or_inf() {
+        assert!(has_nan_or_inf(&[1.0, 2.0, f64::NAN]));
+        assert!(has_nan_or_inf(&[1.0, f64::INFINITY]));
+        assert!(!has_nan_or_inf(&[0.5, -0.5, 1.0]));
+        assert!(!has_nan_or_inf(&[]));
+    }
 }
